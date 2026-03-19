@@ -1,10 +1,29 @@
 import { type RefObject, useCallback, useEffect, useMemo, useState } from 'react'
 
+import {
+  type ImageProcessingOptions,
+  preprocessFrame,
+  resolveProcessingOptions
+} from '../helper/image-processing'
 import { BarcodeFormat, type DetectedBarcode } from '../types'
+
+export type { ImageProcessingOptions }
 
 export interface ScanOptions {
   delay?: number
   formats?: Array<BarcodeFormat | string>
+  /**
+   * Image preprocessing options to improve detection on
+   * low-contrast or difficult-to-read barcodes/QR codes.
+   *
+   * When enabled (default), if the initial detection attempt
+   * fails, the video frame is preprocessed (grayscale conversion,
+   * contrast enhancement, adaptive thresholding) and detection
+   * is retried on the enhanced image.
+   *
+   * Set `{ enabled: false }` to disable preprocessing entirely.
+   */
+  imageProcessing?: ImageProcessingOptions
 }
 
 const DEFAULT_OPTIONS = {
@@ -51,16 +70,34 @@ export function useScanning (ref: RefObject<HTMLVideoElement | null>, provideOpt
     return Object.assign({}, DEFAULT_OPTIONS, provideOptions)
   }, [provideOptions])
 
+  const processingOptions = useMemo(() => {
+    return resolveProcessingOptions(options.imageProcessing)
+  }, [options.imageProcessing])
+
   const scan = useCallback(async () => {
     const target = ref.current
+    if (target == null) return
+
     const detector = new BarcodeDetector({
       formats: options.formats
     })
-    const detected = await detector.detect(target!)
+
+    // First attempt: detect directly from the video element
+    const detected = await detector.detect(target)
     if (detected !== undefined && detected.length > 0) {
       setDetectedBarcodes(detected)
+      return
     }
-  }, [ref, options.formats])
+
+    // Second attempt: preprocess the frame and retry detection
+    if (processingOptions.enabled) {
+      const processedCanvas = preprocessFrame(target, processingOptions)
+      const enhancedDetected = await detector.detect(processedCanvas)
+      if (enhancedDetected !== undefined && enhancedDetected.length > 0) {
+        setDetectedBarcodes(enhancedDetected)
+      }
+    }
+  }, [ref, options.formats, processingOptions])
 
   useEffect(() => {
     const target = ref.current
