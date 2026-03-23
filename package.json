@@ -8,6 +8,9 @@
   "license": "MIT",
   "homepage": "https://reactbarcodescanner.vercel.app/",
   "author": "Ted Lin <preflower.lin@gmail.com> (https://github.com/preflower)",
+  "contributors": [
+    "Jonathan Sánchez <jon.sanchez.garcia@gmail.com>"
+  ],
   "main": "index.js",
   "scripts": {
     "prepare": "husky",
