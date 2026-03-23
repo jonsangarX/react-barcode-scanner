@@ -89,15 +89,19 @@ export function useScanning (ref: RefObject<HTMLVideoElement | null>, provideOpt
       return
     }
 
-    // Fallback: try each preprocessing strategy until one succeeds
+    // Fallback: try each preprocessing strategy lazily until one succeeds.
+    // Each pipeline is only computed when the previous one fails,
+    // avoiding unnecessary work on expensive strategies.
     if (processingOptions.enabled) {
-      const canvases = preprocessFrames(target, processingOptions)
-      for (const canvas of canvases) {
-        const enhancedDetected = await detector.detect(canvas)
+      const iterator = preprocessFrames(target, processingOptions)
+      let result = iterator.next()
+      while (!result.done) {
+        const enhancedDetected = await detector.detect(result.value!)
         if (enhancedDetected !== undefined && enhancedDetected.length > 0) {
           setDetectedBarcodes(enhancedDetected)
           return
         }
+        result = iterator.next()
       }
     }
   }, [ref, options.formats, processingOptions])

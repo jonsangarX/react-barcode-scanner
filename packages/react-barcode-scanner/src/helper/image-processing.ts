@@ -44,10 +44,14 @@ export function resolveProcessingOptions (
   return Object.assign({}, DEFAULT_PROCESSING_OPTIONS, options)
 }
 
+// ---------------------------------------------------------------------------
+// Channel extraction strategies
+// ---------------------------------------------------------------------------
+
 /**
- * A preprocessing strategy is a function that extracts a single-channel
- * (grayscale) representation from raw RGBA pixel data, optimized for
- * a specific type of image (e.g. standard grayscale, red channel isolation).
+ * A channel extraction strategy converts raw RGBA pixel data into a
+ * single-channel (grayscale) buffer optimized for a specific type
+ * of image.
  */
 type ChannelStrategy = (data: Uint8ClampedArray, length: number) => Uint8Array
 
@@ -95,37 +99,67 @@ const greenSubtractedStrategy: ChannelStrategy = (data, length) => {
   return result
 }
 
-/**
- * All preprocessing strategies to attempt, in order.
- * The scan loop tries each one until detection succeeds.
- */
-const STRATEGIES: ChannelStrategy[] = [
-  grayscaleStrategy,
-  redChannelStrategy,
-  greenSubtractedStrategy
-]
+// ---------------------------------------------------------------------------
+// Pipeline configuration
+// ---------------------------------------------------------------------------
+
+interface PipelineConfig {
+  channel: ChannelStrategy
+  contrast: number
+  blockSize: number
+  thresholdOffset: number
+  morphologyRadius: number // 1 = 3x3 cross, 2 = 5x5 cross
+  sharpen: boolean
+  clahe: boolean
+  invert: boolean
+}
 
 /**
- * Generates an array of preprocessed canvas elements from a video
- * frame, one per strategy. Each canvas can be passed directly to
- * BarcodeDetector.detect() as it implements ImageBitmapSource.
+ * All preprocessing pipelines to attempt, ordered from cheapest/most
+ * common to most aggressive. The scan loop tries each one sequentially
+ * until detection succeeds.
+ */
+function buildPipelines (options: Required<ImageProcessingOptions>): PipelineConfig[] {
+  const { contrast, blockSize, thresholdOffset } = options
+
+  return [
+    // --- Tier 1: basic strategies with user/default params ---
+    { channel: grayscaleStrategy, contrast, blockSize, thresholdOffset, morphologyRadius: 1, sharpen: false, clahe: false, invert: false },
+    { channel: redChannelStrategy, contrast, blockSize, thresholdOffset, morphologyRadius: 1, sharpen: false, clahe: false, invert: false },
+    { channel: greenSubtractedStrategy, contrast, blockSize, thresholdOffset, morphologyRadius: 1, sharpen: false, clahe: false, invert: false },
+
+    // --- Tier 2: CLAHE + larger morphology for tough low-contrast ---
+    { channel: redChannelStrategy, contrast: 1, blockSize, thresholdOffset, morphologyRadius: 2, sharpen: false, clahe: true, invert: false },
+    { channel: greenSubtractedStrategy, contrast: 1, blockSize: 21, thresholdOffset: 12, morphologyRadius: 2, sharpen: true, clahe: true, invert: false },
+
+    // --- Tier 3: aggressive params + inversion for worst cases ---
+    { channel: redChannelStrategy, contrast: 3.0, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: true, clahe: false, invert: false },
+    { channel: redChannelStrategy, contrast: 3.0, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
+    { channel: grayscaleStrategy, contrast: 1, blockSize, thresholdOffset, morphologyRadius: 1, sharpen: true, clahe: true, invert: true }
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Captures a video frame and returns a lazy iterator that produces
+ * one preprocessed canvas per pipeline configuration. Each canvas
+ * is only computed when next() is called, so if an early strategy
+ * succeeds the remaining (more expensive) pipelines are never run.
  *
- * Pipeline per strategy:
- *   1. Draw video frame onto an offscreen canvas
- *   2. Extract single channel via the strategy function
- *   3. Apply contrast enhancement
- *   4. Apply adaptive thresholding (local binarization)
- *   5. Apply morphological closing (fill small gaps in QR modules)
- *   6. Apply morphological opening (remove thin noise lines)
+ * Each returned canvas can be passed directly to
+ * BarcodeDetector.detect() as it implements ImageBitmapSource.
  */
 export function preprocessFrames (
   video: HTMLVideoElement,
   options: Required<ImageProcessingOptions>
-): HTMLCanvasElement[] {
+): PreprocessIterator {
   const width = video.videoWidth
   const height = video.videoHeight
 
-  // Capture the raw frame once
+  // Capture the raw frame once and share across all pipelines
   const sourceCanvas = document.createElement('canvas')
   sourceCanvas.width = width
   sourceCanvas.height = height
@@ -133,90 +167,258 @@ export function preprocessFrames (
   sourceCtx.drawImage(video, 0, 0, width, height)
   const sourceData = sourceCtx.getImageData(0, 0, width, height)
 
-  return STRATEGIES.map(strategy => {
-    return applyPipeline(sourceData, strategy, width, height, options)
-  })
+  const pipelines = buildPipelines(options)
+
+  return new PreprocessIterator(sourceData, pipelines, width, height)
+}
+
+/**
+ * Lazy iterator over preprocessing pipelines. Computes one canvas
+ * at a time, only when next() is called.
+ */
+class PreprocessIterator {
+  private sourceData: ImageData
+  private pipelines: PipelineConfig[]
+  private width: number
+  private height: number
+  private index: number
+
+  constructor (sourceData: ImageData, pipelines: PipelineConfig[], width: number, height: number) {
+    this.sourceData = sourceData
+    this.pipelines = pipelines
+    this.width = width
+    this.height = height
+    this.index = 0
+  }
+
+  next (): { done: boolean, value: HTMLCanvasElement | undefined } {
+    if (this.index >= this.pipelines.length) {
+      return { done: true, value: undefined }
+    }
+    const canvas = applyPipeline(
+      this.sourceData,
+      this.pipelines[this.index],
+      this.width,
+      this.height
+    )
+    this.index++
+    return { done: false, value: canvas }
+  }
 }
 
 /**
  * Backwards-compatible single-frame preprocessor.
- * Uses the standard grayscale strategy only.
  */
 export function preprocessFrame (
   video: HTMLVideoElement,
   options: Required<ImageProcessingOptions>
 ): HTMLCanvasElement {
-  return preprocessFrames(video, options)[0]
+  return preprocessFrames(video, options).next().value!
 }
 
-/**
- * Applies the full image processing pipeline for a given
- * channel extraction strategy.
- */
+// ---------------------------------------------------------------------------
+// Core pipeline
+// ---------------------------------------------------------------------------
+
 function applyPipeline (
   sourceData: ImageData,
-  strategy: ChannelStrategy,
+  config: PipelineConfig,
   width: number,
-  height: number,
-  options: Required<ImageProcessingOptions>
+  height: number
 ): HTMLCanvasElement {
-  const { contrast, blockSize, thresholdOffset } = options
   const pixelCount = width * height
 
   // Step 1: Extract single channel
-  const channel = strategy(sourceData.data, pixelCount)
+  let channel = config.channel(sourceData.data, pixelCount)
 
-  // Step 2: Contrast enhancement
-  //   Maps pixel values so that mid-gray (128) stays fixed
-  //   and values spread outward by the contrast factor.
-  for (let i = 0; i < pixelCount; i++) {
-    const value = contrast * (channel[i] - 128) + 128
-    channel[i] = value < 0 ? 0 : value > 255 ? 255 : value
+  // Step 2: CLAHE (before linear contrast, replaces it when enabled)
+  if (config.clahe) {
+    channel = applyCLAHE(channel, width, height, 8, 256, 3.0)
   }
 
-  // Step 3: Adaptive thresholding using integral image
-  //   For each pixel, compute the mean of a local neighborhood
-  //   and binarize based on whether the pixel is below
-  //   (mean - offset). This handles uneven lighting far better
-  //   than a global threshold.
-  const binarized = adaptiveThreshold(channel, width, height, blockSize, thresholdOffset)
+  // Step 3: Linear contrast enhancement
+  if (config.contrast !== 1) {
+    channel = applyContrast(channel, config.contrast)
+  }
 
-  // Step 4: Morphological closing (dilate then erode)
-  //   Fills small gaps inside QR modules that may appear
-  //   due to uneven printing or surface texture.
-  const closed = dilate(binarized, width, height)
-  const closedEroded = erode(closed, width, height)
+  // Step 4: Sharpen (3x3 unsharp-mask style kernel)
+  if (config.sharpen) {
+    channel = applySharpen(channel, width, height)
+  }
 
-  // Step 5: Morphological opening (erode then dilate)
-  //   Removes thin noise lines (like PCB circuit traces)
-  //   that cross through the QR code area.
-  const opened = erode(closedEroded, width, height)
-  const cleaned = dilate(opened, width, height)
+  // Step 5: Adaptive thresholding
+  let binarized = adaptiveThreshold(
+    channel, width, height,
+    config.blockSize, config.thresholdOffset
+  )
+
+  // Step 6: Morphological closing (fills gaps in QR modules)
+  binarized = morphClose(binarized, width, height, config.morphologyRadius)
+
+  // Step 7: Morphological opening (removes thin noise lines)
+  binarized = morphOpen(binarized, width, height, config.morphologyRadius)
+
+  // Step 8: Inversion (optional)
+  if (config.invert) {
+    for (let i = 0; i < pixelCount; i++) {
+      binarized[i] = binarized[i] === 0 ? 255 : 0
+    }
+  }
 
   // Write result to canvas
-  const canvas = document.createElement('canvas')
-  canvas.width = width
-  canvas.height = height
-  const ctx = canvas.getContext('2d')!
-  const outputData = ctx.createImageData(width, height)
-  const out = outputData.data
+  return toCanvas(binarized, width, height)
+}
 
-  for (let i = 0; i < pixelCount; i++) {
-    const v = cleaned[i]
-    const offset = i * 4
-    out[offset] = v
-    out[offset + 1] = v
-    out[offset + 2] = v
-    out[offset + 3] = 255
+// ---------------------------------------------------------------------------
+// Image processing primitives
+// ---------------------------------------------------------------------------
+
+function applyContrast (channel: Uint8Array, contrast: number): Uint8Array {
+  const result = new Uint8Array(channel.length)
+  for (let i = 0; i < channel.length; i++) {
+    const value = contrast * (channel[i] - 128) + 128
+    result[i] = value < 0 ? 0 : value > 255 ? 255 : value
   }
-
-  ctx.putImageData(outputData, 0, 0)
-  return canvas
+  return result
 }
 
 /**
- * Applies adaptive thresholding using a summed-area table
- * (integral image) for O(1) per-pixel neighborhood mean.
+ * Contrast Limited Adaptive Histogram Equalization (CLAHE).
+ *
+ * Divides the image into tiles, computes a contrast-limited
+ * histogram equalization per tile, and bilinearly interpolates
+ * between tiles for a smooth result. This handles uneven
+ * illumination much better than global histogram equalization.
+ */
+function applyCLAHE (
+  channel: Uint8Array,
+  width: number,
+  height: number,
+  tilesXY: number,
+  bins: number,
+  clipLimit: number
+): Uint8Array {
+  const result = new Uint8Array(channel.length)
+  const tileW = Math.ceil(width / tilesXY)
+  const tileH = Math.ceil(height / tilesXY)
+
+  // Build LUTs for each tile
+  const luts: Uint8Array[][] = []
+
+  for (let ty = 0; ty < tilesXY; ty++) {
+    luts[ty] = []
+    for (let tx = 0; tx < tilesXY; tx++) {
+      const x0 = tx * tileW
+      const y0 = ty * tileH
+      const x1 = Math.min(x0 + tileW, width)
+      const y1 = Math.min(y0 + tileH, height)
+
+      // Build histogram
+      const hist = new Float64Array(bins)
+      let count = 0
+      for (let y = y0; y < y1; y++) {
+        for (let x = x0; x < x1; x++) {
+          hist[channel[y * width + x]]++
+          count++
+        }
+      }
+
+      // Clip histogram and redistribute
+      const limit = Math.max(1, (clipLimit * count) / bins)
+      let excess = 0
+      for (let i = 0; i < bins; i++) {
+        if (hist[i] > limit) {
+          excess += hist[i] - limit
+          hist[i] = limit
+        }
+      }
+      const increment = excess / bins
+      for (let i = 0; i < bins; i++) {
+        hist[i] += increment
+      }
+
+      // Build CDF → LUT
+      const lut = new Uint8Array(bins)
+      let cdf = 0
+      for (let i = 0; i < bins; i++) {
+        cdf += hist[i]
+        lut[i] = Math.min(255, Math.round((cdf / count) * 255))
+      }
+
+      luts[ty][tx] = lut
+    }
+  }
+
+  // Bilinear interpolation between tile LUTs
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = y * width + x
+      const px = channel[idx]
+
+      // Fractional tile position (center of each tile)
+      const fx = (x / tileW) - 0.5
+      const fy = (y / tileH) - 0.5
+
+      const tx0 = Math.max(0, Math.floor(fx))
+      const ty0 = Math.max(0, Math.floor(fy))
+      const tx1 = Math.min(tilesXY - 1, tx0 + 1)
+      const ty1 = Math.min(tilesXY - 1, ty0 + 1)
+
+      const dx = Math.max(0, Math.min(1, fx - tx0))
+      const dy = Math.max(0, Math.min(1, fy - ty0))
+
+      const tl = luts[ty0][tx0][px]
+      const tr = luts[ty0][tx1][px]
+      const bl = luts[ty1][tx0][px]
+      const br = luts[ty1][tx1][px]
+
+      result[idx] = Math.round(
+        tl * (1 - dx) * (1 - dy) +
+        tr * dx * (1 - dy) +
+        bl * (1 - dx) * dy +
+        br * dx * dy
+      )
+    }
+  }
+
+  return result
+}
+
+/**
+ * 3x3 sharpening convolution.
+ * Kernel:  [ 0, -1,  0 ]
+ *          [-1,  5, -1 ]
+ *          [ 0, -1,  0 ]
+ */
+function applySharpen (
+  channel: Uint8Array,
+  width: number,
+  height: number
+): Uint8Array {
+  const result = new Uint8Array(channel.length)
+  // Copy border pixels unchanged
+  result.set(channel)
+
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const idx = y * width + x
+      const value =
+        5 * channel[idx] -
+        channel[idx - 1] -
+        channel[idx + 1] -
+        channel[idx - width] -
+        channel[idx + width]
+
+      result[idx] = value < 0 ? 0 : value > 255 ? 255 : value
+    }
+  }
+
+  return result
+}
+
+/**
+ * Adaptive thresholding using integral image for O(1) per-pixel
+ * neighborhood mean computation.
  */
 function adaptiveThreshold (
   channel: Uint8Array,
@@ -248,30 +450,39 @@ function adaptiveThreshold (
   return result
 }
 
+// ---------------------------------------------------------------------------
+// Morphological operations with configurable radius
+// ---------------------------------------------------------------------------
+
 /**
- * Morphological dilation with a 3x3 cross structuring element.
- * A pixel becomes white (255) if any of its 4-connected
- * neighbors is white. This expands bright regions.
+ * Morphological dilation with a cross structuring element of
+ * the given radius (1 = 3x3, 2 = 5x5).
  */
 function dilate (
   src: Uint8Array,
   width: number,
-  height: number
+  height: number,
+  radius: number
 ): Uint8Array {
   const dst = new Uint8Array(src)
 
-  for (let y = 1; y < height - 1; y++) {
-    for (let x = 1; x < width - 1; x++) {
+  for (let y = radius; y < height - radius; y++) {
+    for (let x = radius; x < width - radius; x++) {
       const idx = y * width + x
-      if (
-        src[idx] === 255 ||
-        src[idx - 1] === 255 ||
-        src[idx + 1] === 255 ||
-        src[idx - width] === 255 ||
-        src[idx + width] === 255
-      ) {
-        dst[idx] = 255
+      if (src[idx] === 255) { dst[idx] = 255; continue }
+
+      let found = false
+      for (let r = 1; r <= radius && !found; r++) {
+        if (
+          src[idx - r] === 255 ||
+          src[idx + r] === 255 ||
+          src[idx - r * width] === 255 ||
+          src[idx + r * width] === 255
+        ) {
+          found = true
+        }
       }
+      if (found) dst[idx] = 255
     }
   }
 
@@ -279,42 +490,75 @@ function dilate (
 }
 
 /**
- * Morphological erosion with a 3x3 cross structuring element.
- * A pixel becomes black (0) if any of its 4-connected
- * neighbors is black. This shrinks bright regions and
- * removes thin white lines (noise).
+ * Morphological erosion with a cross structuring element of
+ * the given radius (1 = 3x3, 2 = 5x5).
  */
 function erode (
   src: Uint8Array,
   width: number,
-  height: number
+  height: number,
+  radius: number
 ): Uint8Array {
   const dst = new Uint8Array(src)
 
-  for (let y = 1; y < height - 1; y++) {
-    for (let x = 1; x < width - 1; x++) {
+  for (let y = radius; y < height - radius; y++) {
+    for (let x = radius; x < width - radius; x++) {
       const idx = y * width + x
-      if (
-        src[idx] === 0 ||
-        src[idx - 1] === 0 ||
-        src[idx + 1] === 0 ||
-        src[idx - width] === 0 ||
-        src[idx + width] === 0
-      ) {
-        dst[idx] = 0
+      if (src[idx] === 0) { dst[idx] = 0; continue }
+
+      let found = false
+      for (let r = 1; r <= radius && !found; r++) {
+        if (
+          src[idx - r] === 0 ||
+          src[idx + r] === 0 ||
+          src[idx - r * width] === 0 ||
+          src[idx + r * width] === 0
+        ) {
+          found = true
+        }
       }
+      if (found) dst[idx] = 0
     }
   }
 
   return dst
 }
 
-/**
- * Computes a summed-area table (integral image) from a single-channel
- * buffer. This allows O(1) computation of the sum of any
- * rectangular region, which is essential for fast adaptive
- * thresholding.
- */
+/** Morphological closing: dilate then erode. Fills small gaps. */
+function morphClose (src: Uint8Array, w: number, h: number, r: number): Uint8Array {
+  return erode(dilate(src, w, h, r), w, h, r)
+}
+
+/** Morphological opening: erode then dilate. Removes thin noise. */
+function morphOpen (src: Uint8Array, w: number, h: number, r: number): Uint8Array {
+  return dilate(erode(src, w, h, r), w, h, r)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function toCanvas (buffer: Uint8Array, width: number, height: number): HTMLCanvasElement {
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const ctx = canvas.getContext('2d')!
+  const imageData = ctx.createImageData(width, height)
+  const out = imageData.data
+
+  for (let i = 0; i < buffer.length; i++) {
+    const v = buffer[i]
+    const offset = i * 4
+    out[offset] = v
+    out[offset + 1] = v
+    out[offset + 2] = v
+    out[offset + 3] = 255
+  }
+
+  ctx.putImageData(imageData, 0, 0)
+  return canvas
+}
+
 function computeIntegralImage (
   channel: Uint8Array,
   width: number,
@@ -334,10 +578,6 @@ function computeIntegralImage (
   return integral
 }
 
-/**
- * Returns the sum of pixel values within a rectangle using the
- * integral image. Uses the inclusion-exclusion principle.
- */
 function getIntegralSum (
   integral: Float64Array,
   width: number,
