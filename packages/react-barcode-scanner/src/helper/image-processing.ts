@@ -116,26 +116,57 @@ interface PipelineConfig {
 
 /**
  * All preprocessing pipelines to attempt, ordered from cheapest/most
- * common to most aggressive. The scan loop tries each one sequentially
- * until detection succeeds.
+ * common to most aggressive. The scan loop tries each one lazily
+ * (via PreprocessIterator) until detection succeeds.
+ *
+ * Strategy rationale (informed by field testing with copper-on-green
+ * PCB QR codes on iOS):
+ *
+ *   - Tier 1 (3 pipelines): Quick check with basic channel strategies
+ *     and user/default params. Covers the common case where the QR
+ *     has decent contrast.
+ *
+ *   - Tier 2 (14 pipelines): Focused parameter sweep on the
+ *     empirically proven winning formula: red channel extraction +
+ *     aggressive contrast + adaptive threshold + inversion.
+ *     Varies contrast (2.0–4.5), blockSize (11–31), thresholdOffset
+ *     (8–20), morphology radius (1–2), and sharpen (on/off) to cover
+ *     different distances, lighting angles, and focus conditions.
+ *
+ *   - Tier 3 (2 pipelines): CLAHE-based fallbacks as last resort,
+ *     which are the most expensive but handle extreme uneven lighting.
  */
 function buildPipelines (options: Required<ImageProcessingOptions>): PipelineConfig[] {
   const { contrast, blockSize, thresholdOffset } = options
 
   return [
-    // --- Tier 1: basic strategies with user/default params ---
+    // --- Tier 1: basic strategies with user/default params (quick check) ---
     { channel: grayscaleStrategy, contrast, blockSize, thresholdOffset, morphologyRadius: 1, sharpen: false, clahe: false, invert: false },
     { channel: redChannelStrategy, contrast, blockSize, thresholdOffset, morphologyRadius: 1, sharpen: false, clahe: false, invert: false },
     { channel: greenSubtractedStrategy, contrast, blockSize, thresholdOffset, morphologyRadius: 1, sharpen: false, clahe: false, invert: false },
 
-    // --- Tier 2: CLAHE + larger morphology for tough low-contrast ---
-    { channel: redChannelStrategy, contrast: 1, blockSize, thresholdOffset, morphologyRadius: 2, sharpen: false, clahe: true, invert: false },
-    { channel: greenSubtractedStrategy, contrast: 1, blockSize: 21, thresholdOffset: 12, morphologyRadius: 2, sharpen: true, clahe: true, invert: false },
-
-    // --- Tier 3: aggressive params + inversion for worst cases ---
-    { channel: redChannelStrategy, contrast: 3.0, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: true, clahe: false, invert: false },
+    // --- Tier 2: red channel + aggressive contrast + inversion sweep ---
+    // Varying contrast and blockSize to cover near/far distances
+    { channel: redChannelStrategy, contrast: 2.0, blockSize: 11, thresholdOffset: 8, morphologyRadius: 1, sharpen: false, clahe: false, invert: true },
+    { channel: redChannelStrategy, contrast: 2.5, blockSize: 15, thresholdOffset: 10, morphologyRadius: 1, sharpen: false, clahe: false, invert: true },
+    { channel: redChannelStrategy, contrast: 3.0, blockSize: 15, thresholdOffset: 12, morphologyRadius: 1, sharpen: false, clahe: false, invert: true },
+    { channel: redChannelStrategy, contrast: 3.0, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
+    { channel: redChannelStrategy, contrast: 3.5, blockSize: 15, thresholdOffset: 12, morphologyRadius: 1, sharpen: false, clahe: false, invert: true },
+    { channel: redChannelStrategy, contrast: 3.5, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
+    { channel: redChannelStrategy, contrast: 4.0, blockSize: 21, thresholdOffset: 18, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
+    { channel: redChannelStrategy, contrast: 4.5, blockSize: 31, thresholdOffset: 20, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
+    // Same sweep with sharpening enabled (helps with slightly out-of-focus frames)
+    { channel: redChannelStrategy, contrast: 2.5, blockSize: 15, thresholdOffset: 10, morphologyRadius: 1, sharpen: true, clahe: false, invert: true },
     { channel: redChannelStrategy, contrast: 3.0, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
-    { channel: grayscaleStrategy, contrast: 1, blockSize, thresholdOffset, morphologyRadius: 1, sharpen: true, clahe: true, invert: true }
+    { channel: redChannelStrategy, contrast: 3.5, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
+    { channel: redChannelStrategy, contrast: 4.0, blockSize: 21, thresholdOffset: 18, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
+    // Green-subtracted variants (copper-on-green specific)
+    { channel: greenSubtractedStrategy, contrast: 3.0, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
+    { channel: greenSubtractedStrategy, contrast: 3.5, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
+
+    // --- Tier 3: CLAHE-based fallbacks (most expensive, last resort) ---
+    { channel: redChannelStrategy, contrast: 1, blockSize: 21, thresholdOffset: 12, morphologyRadius: 2, sharpen: true, clahe: true, invert: true },
+    { channel: greenSubtractedStrategy, contrast: 1, blockSize: 21, thresholdOffset: 12, morphologyRadius: 2, sharpen: true, clahe: true, invert: true }
   ]
 }
 
