@@ -51,22 +51,10 @@ export function resolveProcessingOptions (
 /**
  * A channel extraction strategy converts raw RGBA pixel data into a
  * single-channel (grayscale) buffer optimized for a specific type
- * of image.
+ * of image. Receives width and height to support strategies that
+ * need spatial awareness (e.g. CLAHE pre-processing).
  */
-type ChannelStrategy = (data: Uint8ClampedArray, length: number) => Uint8Array
-
-/**
- * Standard grayscale conversion using ITU-R BT.601 luma coefficients.
- * Works well for most barcode/QR images with reasonable contrast.
- */
-const grayscaleStrategy: ChannelStrategy = (data, length) => {
-  const result = new Uint8Array(length)
-  for (let i = 0; i < length; i++) {
-    const offset = i * 4
-    result[i] = 0.299 * data[offset] + 0.587 * data[offset + 1] + 0.114 * data[offset + 2]
-  }
-  return result
-}
+type ChannelStrategy = (data: Uint8ClampedArray, length: number, width: number, height: number) => Uint8Array
 
 /**
  * Red channel isolation strategy.
@@ -83,20 +71,19 @@ const redChannelStrategy: ChannelStrategy = (data, length) => {
 }
 
 /**
- * Green-subtracted strategy.
- * Computes max(R - G, 0), which maximizes contrast when the
- * foreground is warm-toned (copper/gold) and the background is
- * green-dominant. Circuit traces that are dark in all channels
- * collapse to zero, further cleaning the image.
+ * CLAHE-pre-enhanced red channel strategy (compound strategy).
+ * Extracts the red channel from raw RGBA data, then applies CLAHE
+ * to adaptively equalize contrast before returning. This normalizes
+ * uneven illumination at the channel level, giving the downstream
+ * pipeline (linear contrast + threshold) a much cleaner input signal.
+ * Particularly effective for copper-on-green PCBs under varying light.
  */
-const greenSubtractedStrategy: ChannelStrategy = (data, length) => {
-  const result = new Uint8Array(length)
+const clahePreRedStrategy: ChannelStrategy = (data, length, width, height) => {
+  const red = new Uint8Array(length)
   for (let i = 0; i < length; i++) {
-    const offset = i * 4
-    const diff = data[offset] - data[offset + 1]
-    result[i] = diff > 0 ? diff : 0
+    red[i] = data[i * 4]
   }
-  return result
+  return applyCLAHE(red, width, height, 8, 256, 3.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +91,8 @@ const greenSubtractedStrategy: ChannelStrategy = (data, length) => {
 // ---------------------------------------------------------------------------
 
 interface PipelineConfig {
+  /** Descriptive name for debug logging (e.g. 'W1-red-c3.0-b21-inv-m2') */
+  name: string
   channel: ChannelStrategy
   contrast: number
   blockSize: number
@@ -118,69 +107,32 @@ interface PipelineConfig {
  * All preprocessing pipelines to attempt. The scan loop tries each
  * one lazily (via PreprocessIterator) until detection succeeds.
  *
- * Pipeline order is informed by field testing with copper-on-green
- * PCB QR codes on iOS. The proven winners run first to minimize
- * time-to-detection:
+ * Pipeline order is informed by extensive field testing with
+ * copper-on-green PCB QR codes on iOS and Android. Only the
+ * empirically proven winners are included to minimize cycle time
+ * on low-end devices:
  *
- *   - Tier 1 (proven winners, 3 pipelines): The exact parameter
- *     combinations that succeeded in field tests. These run before
- *     anything else.
+ *   1. C1-C2 (CLAHE-pre-enhanced red channel): Highest success rate
+ *      in field tests. CLAHE normalizes uneven illumination at the
+ *      channel level before the rest of the pipeline runs.
  *
- *   - Tier 2 (dense sweep, ~16 pipelines): Red channel + inversion
- *     with denser parameter variations around the winning range.
- *     Contrast [3.0–4.5], blockSize [21, 25, 31]. Covers different
- *     distances, lighting angles, and focus conditions.
+ *   2. W1-W3 (red channel + aggressive contrast + inversion):
+ *      Lighter fallback that succeeds in some lighting conditions
+ *      where CLAHE is not needed.
  *
- *   - Tier 3 (CLAHE fallbacks, 2 pipelines): Most expensive but
- *     handles extreme uneven lighting.
- *
- *   - Tier 4 (basic strategies, 3 pipelines): Standard grayscale/
- *     red/green-sub without inversion. Only useful for high-contrast
- *     QR codes that direct detection would normally catch anyway.
- *     Moved to last position since they never succeed on low-contrast
- *     PCB QR codes.
+ * Total worst case: ~400ms (5 pipelines), well within the 500ms
+ * scan cycle.
  */
-function buildPipelines (options: Required<ImageProcessingOptions>): PipelineConfig[] {
-  const { contrast, blockSize, thresholdOffset } = options
-
+function buildPipelines (): PipelineConfig[] {
   return [
-    // --- Tier 1: proven winners from field testing (run first) ---
-    { channel: redChannelStrategy, contrast: 3.0, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
-    { channel: redChannelStrategy, contrast: 3.5, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
-    { channel: redChannelStrategy, contrast: 4.5, blockSize: 31, thresholdOffset: 20, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
+    // --- C: CLAHE-pre-enhanced red channel (highest success rate) ---
+    { name: 'C1-clahered-c3.0-b21-inv-m2', channel: clahePreRedStrategy, contrast: 3.0, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
+    { name: 'C2-clahered-c3.5-b25-inv-m2', channel: clahePreRedStrategy, contrast: 3.5, blockSize: 25, thresholdOffset: 15, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
 
-    // --- Tier 2: dense sweep around the winning parameter range ---
-    // BlockSize 21 sweep (medium distance)
-    { channel: redChannelStrategy, contrast: 3.0, blockSize: 21, thresholdOffset: 12, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
-    { channel: redChannelStrategy, contrast: 3.5, blockSize: 21, thresholdOffset: 18, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
-    { channel: redChannelStrategy, contrast: 4.0, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
-    { channel: redChannelStrategy, contrast: 4.0, blockSize: 21, thresholdOffset: 18, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
-    // BlockSize 25 sweep (intermediate distance)
-    { channel: redChannelStrategy, contrast: 3.0, blockSize: 25, thresholdOffset: 15, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
-    { channel: redChannelStrategy, contrast: 3.5, blockSize: 25, thresholdOffset: 15, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
-    { channel: redChannelStrategy, contrast: 4.0, blockSize: 25, thresholdOffset: 18, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
-    { channel: redChannelStrategy, contrast: 4.5, blockSize: 25, thresholdOffset: 20, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
-    // BlockSize 31 sweep (far distance / small QR)
-    { channel: redChannelStrategy, contrast: 3.0, blockSize: 31, thresholdOffset: 18, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
-    { channel: redChannelStrategy, contrast: 3.5, blockSize: 31, thresholdOffset: 18, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
-    { channel: redChannelStrategy, contrast: 4.0, blockSize: 31, thresholdOffset: 20, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
-    // Sharpen variants of the winners (out-of-focus frames)
-    { channel: redChannelStrategy, contrast: 3.0, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
-    { channel: redChannelStrategy, contrast: 3.5, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
-    { channel: redChannelStrategy, contrast: 4.0, blockSize: 25, thresholdOffset: 18, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
-    { channel: redChannelStrategy, contrast: 4.5, blockSize: 31, thresholdOffset: 20, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
-    // Green-subtracted variants (copper-on-green specific)
-    { channel: greenSubtractedStrategy, contrast: 3.0, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
-    { channel: greenSubtractedStrategy, contrast: 3.5, blockSize: 25, thresholdOffset: 15, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
-
-    // --- Tier 3: CLAHE-based fallbacks (most expensive, last resort) ---
-    { channel: redChannelStrategy, contrast: 1, blockSize: 21, thresholdOffset: 12, morphologyRadius: 2, sharpen: true, clahe: true, invert: true },
-    { channel: greenSubtractedStrategy, contrast: 1, blockSize: 21, thresholdOffset: 12, morphologyRadius: 2, sharpen: true, clahe: true, invert: true },
-
-    // --- Tier 4: basic strategies (fallback for high-contrast QR codes) ---
-    { channel: grayscaleStrategy, contrast, blockSize, thresholdOffset, morphologyRadius: 1, sharpen: false, clahe: false, invert: false },
-    { channel: redChannelStrategy, contrast, blockSize, thresholdOffset, morphologyRadius: 1, sharpen: false, clahe: false, invert: false },
-    { channel: greenSubtractedStrategy, contrast, blockSize, thresholdOffset, morphologyRadius: 1, sharpen: false, clahe: false, invert: false }
+    // --- W: proven winners (lighter fallback) ---
+    { name: 'W1-red-c3.0-b21-inv-m2', channel: redChannelStrategy, contrast: 3.0, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
+    { name: 'W2-red-c3.5-b21-inv-m2', channel: redChannelStrategy, contrast: 3.5, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
+    { name: 'W3-red-c4.5-b31-inv-m2', channel: redChannelStrategy, contrast: 4.5, blockSize: 31, thresholdOffset: 20, morphologyRadius: 2, sharpen: false, clahe: false, invert: true }
   ]
 }
 
@@ -199,7 +151,7 @@ function buildPipelines (options: Required<ImageProcessingOptions>): PipelineCon
  */
 export function preprocessFrames (
   video: HTMLVideoElement,
-  options: Required<ImageProcessingOptions>
+  _options: Required<ImageProcessingOptions>
 ): PreprocessIterator {
   const width = video.videoWidth
   const height = video.videoHeight
@@ -212,7 +164,7 @@ export function preprocessFrames (
   sourceCtx.drawImage(video, 0, 0, width, height)
   const sourceData = sourceCtx.getImageData(0, 0, width, height)
 
-  const pipelines = buildPipelines(options)
+  const pipelines = buildPipelines()
 
   return new PreprocessIterator(sourceData, pipelines, width, height)
 }
@@ -274,7 +226,7 @@ function applyPipeline (
   const pixelCount = width * height
 
   // Step 1: Extract single channel
-  let channel = config.channel(sourceData.data, pixelCount)
+  let channel = config.channel(sourceData.data, pixelCount, width, height)
 
   // Step 2: CLAHE (before linear contrast, replaces it when enabled)
   if (config.clahe) {
