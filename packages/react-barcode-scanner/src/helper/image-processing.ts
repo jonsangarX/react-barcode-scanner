@@ -115,58 +115,72 @@ interface PipelineConfig {
 }
 
 /**
- * All preprocessing pipelines to attempt, ordered from cheapest/most
- * common to most aggressive. The scan loop tries each one lazily
- * (via PreprocessIterator) until detection succeeds.
+ * All preprocessing pipelines to attempt. The scan loop tries each
+ * one lazily (via PreprocessIterator) until detection succeeds.
  *
- * Strategy rationale (informed by field testing with copper-on-green
- * PCB QR codes on iOS):
+ * Pipeline order is informed by field testing with copper-on-green
+ * PCB QR codes on iOS. The proven winners run first to minimize
+ * time-to-detection:
  *
- *   - Tier 1 (3 pipelines): Quick check with basic channel strategies
- *     and user/default params. Covers the common case where the QR
- *     has decent contrast.
+ *   - Tier 1 (proven winners, 3 pipelines): The exact parameter
+ *     combinations that succeeded in field tests. These run before
+ *     anything else.
  *
- *   - Tier 2 (14 pipelines): Focused parameter sweep on the
- *     empirically proven winning formula: red channel extraction +
- *     aggressive contrast + adaptive threshold + inversion.
- *     Varies contrast (2.0–4.5), blockSize (11–31), thresholdOffset
- *     (8–20), morphology radius (1–2), and sharpen (on/off) to cover
- *     different distances, lighting angles, and focus conditions.
+ *   - Tier 2 (dense sweep, ~16 pipelines): Red channel + inversion
+ *     with denser parameter variations around the winning range.
+ *     Contrast [3.0–4.5], blockSize [21, 25, 31]. Covers different
+ *     distances, lighting angles, and focus conditions.
  *
- *   - Tier 3 (2 pipelines): CLAHE-based fallbacks as last resort,
- *     which are the most expensive but handle extreme uneven lighting.
+ *   - Tier 3 (CLAHE fallbacks, 2 pipelines): Most expensive but
+ *     handles extreme uneven lighting.
+ *
+ *   - Tier 4 (basic strategies, 3 pipelines): Standard grayscale/
+ *     red/green-sub without inversion. Only useful for high-contrast
+ *     QR codes that direct detection would normally catch anyway.
+ *     Moved to last position since they never succeed on low-contrast
+ *     PCB QR codes.
  */
 function buildPipelines (options: Required<ImageProcessingOptions>): PipelineConfig[] {
   const { contrast, blockSize, thresholdOffset } = options
 
   return [
-    // --- Tier 1: basic strategies with user/default params (quick check) ---
-    { channel: grayscaleStrategy, contrast, blockSize, thresholdOffset, morphologyRadius: 1, sharpen: false, clahe: false, invert: false },
-    { channel: redChannelStrategy, contrast, blockSize, thresholdOffset, morphologyRadius: 1, sharpen: false, clahe: false, invert: false },
-    { channel: greenSubtractedStrategy, contrast, blockSize, thresholdOffset, morphologyRadius: 1, sharpen: false, clahe: false, invert: false },
-
-    // --- Tier 2: red channel + aggressive contrast + inversion sweep ---
-    // Varying contrast and blockSize to cover near/far distances
-    { channel: redChannelStrategy, contrast: 2.0, blockSize: 11, thresholdOffset: 8, morphologyRadius: 1, sharpen: false, clahe: false, invert: true },
-    { channel: redChannelStrategy, contrast: 2.5, blockSize: 15, thresholdOffset: 10, morphologyRadius: 1, sharpen: false, clahe: false, invert: true },
-    { channel: redChannelStrategy, contrast: 3.0, blockSize: 15, thresholdOffset: 12, morphologyRadius: 1, sharpen: false, clahe: false, invert: true },
+    // --- Tier 1: proven winners from field testing (run first) ---
     { channel: redChannelStrategy, contrast: 3.0, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
-    { channel: redChannelStrategy, contrast: 3.5, blockSize: 15, thresholdOffset: 12, morphologyRadius: 1, sharpen: false, clahe: false, invert: true },
     { channel: redChannelStrategy, contrast: 3.5, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
-    { channel: redChannelStrategy, contrast: 4.0, blockSize: 21, thresholdOffset: 18, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
     { channel: redChannelStrategy, contrast: 4.5, blockSize: 31, thresholdOffset: 20, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
-    // Same sweep with sharpening enabled (helps with slightly out-of-focus frames)
-    { channel: redChannelStrategy, contrast: 2.5, blockSize: 15, thresholdOffset: 10, morphologyRadius: 1, sharpen: true, clahe: false, invert: true },
+
+    // --- Tier 2: dense sweep around the winning parameter range ---
+    // BlockSize 21 sweep (medium distance)
+    { channel: redChannelStrategy, contrast: 3.0, blockSize: 21, thresholdOffset: 12, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
+    { channel: redChannelStrategy, contrast: 3.5, blockSize: 21, thresholdOffset: 18, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
+    { channel: redChannelStrategy, contrast: 4.0, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
+    { channel: redChannelStrategy, contrast: 4.0, blockSize: 21, thresholdOffset: 18, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
+    // BlockSize 25 sweep (intermediate distance)
+    { channel: redChannelStrategy, contrast: 3.0, blockSize: 25, thresholdOffset: 15, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
+    { channel: redChannelStrategy, contrast: 3.5, blockSize: 25, thresholdOffset: 15, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
+    { channel: redChannelStrategy, contrast: 4.0, blockSize: 25, thresholdOffset: 18, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
+    { channel: redChannelStrategy, contrast: 4.5, blockSize: 25, thresholdOffset: 20, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
+    // BlockSize 31 sweep (far distance / small QR)
+    { channel: redChannelStrategy, contrast: 3.0, blockSize: 31, thresholdOffset: 18, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
+    { channel: redChannelStrategy, contrast: 3.5, blockSize: 31, thresholdOffset: 18, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
+    { channel: redChannelStrategy, contrast: 4.0, blockSize: 31, thresholdOffset: 20, morphologyRadius: 2, sharpen: false, clahe: false, invert: true },
+    // Sharpen variants of the winners (out-of-focus frames)
     { channel: redChannelStrategy, contrast: 3.0, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
     { channel: redChannelStrategy, contrast: 3.5, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
-    { channel: redChannelStrategy, contrast: 4.0, blockSize: 21, thresholdOffset: 18, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
+    { channel: redChannelStrategy, contrast: 4.0, blockSize: 25, thresholdOffset: 18, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
+    { channel: redChannelStrategy, contrast: 4.5, blockSize: 31, thresholdOffset: 20, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
     // Green-subtracted variants (copper-on-green specific)
     { channel: greenSubtractedStrategy, contrast: 3.0, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
-    { channel: greenSubtractedStrategy, contrast: 3.5, blockSize: 21, thresholdOffset: 15, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
+    { channel: greenSubtractedStrategy, contrast: 3.5, blockSize: 25, thresholdOffset: 15, morphologyRadius: 2, sharpen: true, clahe: false, invert: true },
 
     // --- Tier 3: CLAHE-based fallbacks (most expensive, last resort) ---
     { channel: redChannelStrategy, contrast: 1, blockSize: 21, thresholdOffset: 12, morphologyRadius: 2, sharpen: true, clahe: true, invert: true },
-    { channel: greenSubtractedStrategy, contrast: 1, blockSize: 21, thresholdOffset: 12, morphologyRadius: 2, sharpen: true, clahe: true, invert: true }
+    { channel: greenSubtractedStrategy, contrast: 1, blockSize: 21, thresholdOffset: 12, morphologyRadius: 2, sharpen: true, clahe: true, invert: true },
+
+    // --- Tier 4: basic strategies (fallback for high-contrast QR codes) ---
+    { channel: grayscaleStrategy, contrast, blockSize, thresholdOffset, morphologyRadius: 1, sharpen: false, clahe: false, invert: false },
+    { channel: redChannelStrategy, contrast, blockSize, thresholdOffset, morphologyRadius: 1, sharpen: false, clahe: false, invert: false },
+    { channel: greenSubtractedStrategy, contrast, blockSize, thresholdOffset, morphologyRadius: 1, sharpen: false, clahe: false, invert: false }
   ]
 }
 

@@ -27,7 +27,7 @@ export interface ScanOptions {
 }
 
 const DEFAULT_OPTIONS = {
-  delay: 1000,
+  delay: 500,
   formats: ['qr_code']
 }
 
