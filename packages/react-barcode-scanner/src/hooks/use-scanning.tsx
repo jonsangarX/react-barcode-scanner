@@ -2,7 +2,7 @@ import { type RefObject, useCallback, useEffect, useMemo, useState } from 'react
 
 import {
   type ImageProcessingOptions,
-  preprocessFrame,
+  preprocessFrames,
   resolveProcessingOptions
 } from '../helper/image-processing'
 import { BarcodeFormat, type DetectedBarcode } from '../types'
@@ -89,12 +89,15 @@ export function useScanning (ref: RefObject<HTMLVideoElement | null>, provideOpt
       return
     }
 
-    // Second attempt: preprocess the frame and retry detection
+    // Fallback: try each preprocessing strategy until one succeeds
     if (processingOptions.enabled) {
-      const processedCanvas = preprocessFrame(target, processingOptions)
-      const enhancedDetected = await detector.detect(processedCanvas)
-      if (enhancedDetected !== undefined && enhancedDetected.length > 0) {
-        setDetectedBarcodes(enhancedDetected)
+      const canvases = preprocessFrames(target, processingOptions)
+      for (const canvas of canvases) {
+        const enhancedDetected = await detector.detect(canvas)
+        if (enhancedDetected !== undefined && enhancedDetected.length > 0) {
+          setDetectedBarcodes(enhancedDetected)
+          return
+        }
       }
     }
   }, [ref, options.formats, processingOptions])
