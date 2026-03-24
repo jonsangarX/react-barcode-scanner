@@ -1,0 +1,113 @@
+# =============================================================================
+# GitLab CI/CD — Modelo hibrido de publicacion
+#
+# Este pipeline publica automaticamente en Verdaccio SOLO cuando detecta
+# que la version en package.json ha cambiado respecto a la del registry.
+#
+# Flujo del desarrollador:
+#   1. Hacer cambios en el codigo
+#   2. npm version patch/minor/major (en packages/react-barcode-scanner/)
+#   3. git push && git push --tags
+#   4. El pipeline detecta la nueva version, hace build, publish y release
+#
+# Variables CI/CD necesarias (Settings > CI/CD > Variables):
+#   - NPM_TOKEN: token de autenticacion de Verdaccio
+# =============================================================================
+
+stages:
+  - quality
+  - publish
+  - release
+
+variables:
+  PACKAGE_DIR: packages/react-barcode-scanner
+  REGISTRY_URL: http://npmreg.airzonesl.es:4873/
+  PACKAGE_NAME: "@airzone/react-barcode-scanner"
+
+# ---------------------------------------------------------------------------
+# Cache de dependencias (compartido entre stages)
+# ---------------------------------------------------------------------------
+.pnpm-cache: &pnpm-cache
+  cache:
+    key:
+      files:
+        - pnpm-lock.yaml
+    paths:
+      - .pnpm-store/
+    policy: pull-push
+
+# ---------------------------------------------------------------------------
+# Stage: quality — type-check + lint
+# ---------------------------------------------------------------------------
+quality:
+  stage: quality
+  image: node:24-alpine
+  <<: *pnpm-cache
+  before_script:
+    - npm i -g pnpm
+    - pnpm config set store-dir .pnpm-store
+    - pnpm install --no-frozen-lockfile
+  script:
+    - pnpm exec tsc --noEmit
+    - pnpm lint
+  only:
+    - master
+
+# ---------------------------------------------------------------------------
+# Stage: publish — build + npm publish (solo si la version es nueva)
+# ---------------------------------------------------------------------------
+publish:
+  stage: publish
+  image: node:24-alpine
+  <<: *pnpm-cache
+  before_script:
+    - npm i -g pnpm
+    - pnpm config set store-dir .pnpm-store
+    - pnpm install --no-frozen-lockfile
+  script:
+    # Obtener la version local del package.json
+    - LOCAL_VERSION=$(node -p "require('./${PACKAGE_DIR}/package.json').version")
+    - echo "Version local - $LOCAL_VERSION"
+
+    # Obtener la version publicada en el registry (o "none" si no existe)
+    - >
+      PUBLISHED_VERSION=$(npm view ${PACKAGE_NAME}
+      version --registry ${REGISTRY_URL} 2>/dev/null || echo "none")
+    - echo "Version en registry - $PUBLISHED_VERSION"
+
+    # Comparar versiones y publicar solo si son diferentes
+    - |
+      if [ "$LOCAL_VERSION" = "$PUBLISHED_VERSION" ]; then
+        echo "Version $LOCAL_VERSION ya publicada. Nada que hacer."
+        exit 0
+      fi
+
+      echo "Nueva version detectada: $PUBLISHED_VERSION -> $LOCAL_VERSION"
+      echo "Ejecutando build..."
+      pnpm --filter ${PACKAGE_NAME} build
+
+      echo "Publicando en registry..."
+      echo "//${REGISTRY_URL#http://}:_authToken=${NPM_TOKEN}" > ${PACKAGE_DIR}/.npmrc
+      cd ${PACKAGE_DIR}
+      npm publish
+      echo "Publicado ${PACKAGE_NAME}@${LOCAL_VERSION}"
+  only:
+    - master
+
+# ---------------------------------------------------------------------------
+# Stage: release — crear release en GitLab con tag
+# ---------------------------------------------------------------------------
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  script:
+    - LOCAL_VERSION=$(cat ${PACKAGE_DIR}/package.json | grep '"version"' | head -1 | sed 's/.*"version".*"\(.*\)".*/\1/')
+    - echo "Creando release v${LOCAL_VERSION}"
+  release:
+    tag_name: "v${LOCAL_VERSION}"
+    name: "v${LOCAL_VERSION}"
+    description: "Release ${PACKAGE_NAME}@${LOCAL_VERSION}"
+  only:
+    - tags
+  except:
+    - branches

@@ -3,22 +3,25 @@ on:
   push:
     branches:
       - master
-    paths:
-      - '.changeset/**'
-      - '.github/workflows/release.yml'
     # Allows you to run this workflow manually from the Actions tab
-    workflow_dispatch:
+  workflow_dispatch:
 
-# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
 permissions:
   contents: write
+  packages: write
   id-token: write
-  pull-requests: write
+
 env:
   CI: true
   PNPM_CACHE_FOLDER: .pnpm-store
+  PACKAGE_DIR: packages/react-barcode-scanner
+
 jobs:
-  release:
+  # ---------------------------------------------------------------------------
+  # Publish to GitHub Packages as @jonsangarx/react-barcode-scanner
+  # Only runs when the version in package.json differs from the published one
+  # ---------------------------------------------------------------------------
+  publish-github:
     timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
@@ -26,23 +29,53 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
       - name: Setup node.js
         uses: actions/setup-node@v6
         with:
           node-version: 24.13.1
-          registry-url: 'https://registry.npmjs.org'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@jonsangarx'
+
       - name: Install pnpm
         run: npm i pnpm@latest -g
+
       - name: Setup pnpm config
         run: pnpm config set store-dir $PNPM_CACHE_FOLDER
+
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
-      - name: Create and publish versions
-        uses: changesets/action@v1
-        with:
-          version: pnpm ci:version
-          commit: "chore: update versions"
-          title: "chore: update versions"
-          publish: pnpm ci:publish
+
+      - name: Check version and publish
+        run: |
+          LOCAL_VERSION=$(node -p "require('./${PACKAGE_DIR}/package.json').version")
+          echo "Local version: $LOCAL_VERSION"
+
+          PUBLISHED_VERSION=$(npm view @jonsangarx/react-barcode-scanner version --registry https://npm.pkg.github.com/ 2>/dev/null || echo "none")
+          echo "Published version: $PUBLISHED_VERSION"
+
+          if [ "$LOCAL_VERSION" = "$PUBLISHED_VERSION" ]; then
+            echo "Version $LOCAL_VERSION already published. Nothing to do."
+            exit 0
+          fi
+
+          echo "New version detected: $PUBLISHED_VERSION -> $LOCAL_VERSION"
+
+          echo "Building..."
+          pnpm --filter react-barcode-scanner build
+
+          echo "Publishing to GitHub Packages..."
+          cd ${PACKAGE_DIR}
+
+          # Override package name and registry for GitHub Packages scope
+          node -e "
+            const pkg = require('./package.json');
+            pkg.name = '@jonsangarx/react-barcode-scanner';
+            pkg.publishConfig = { registry: 'https://npm.pkg.github.com/' };
+            require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
+          "
+
+          npm publish --no-git-checks
+          echo "Published @jonsangarx/react-barcode-scanner@${LOCAL_VERSION}"
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

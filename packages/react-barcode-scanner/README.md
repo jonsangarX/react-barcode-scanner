@@ -160,66 +160,120 @@ import '@airzone/react-barcode-scanner/polyfill'
 ## Repositorio
 
 - **GitLab (interno):** http://gitlab2.airzonesl.es:30080/airzone-front/react-barcode-scanner
+- **GitHub:** https://github.com/jonsangarX/react-barcode-scanner
 - **Upstream (original):** https://github.com/preflower/react-barcode-scanner
 
 ---
 
 ## Versionado y publicacion del paquete
 
-El paquete se publica en el registry npm interno de Airzone (`http://npmreg.airzonesl.es:4873/`).
+El paquete se publica en **dos registries** de forma simultanea:
 
-### Bump de version
+| Registry | Nombre del paquete | Uso |
+|----------|-------------------|-----|
+| Verdaccio (interno) | `@airzone/react-barcode-scanner` | Proyectos internos con acceso a la red corporativa |
+| GitHub Packages | `@jonsangarx/react-barcode-scanner` | Proyectos en Vercel u otros entornos sin acceso a DNS interna |
 
-Desde la raiz del monorepo:
+La publicacion sigue un **modelo hibrido**: tu controlas cuando se publica haciendo un bump de version manual, y los pipelines de CI se encargan automaticamente del build y la publicacion.
 
-```bash
-cd packages/react-barcode-scanner
+> **IMPORTANTE**: Sin el bump de version, los pipelines NO publicaran aunque hagas push a master. Esto es intencionado para evitar releases innecesarias (ej. un fix de un typo no deberia generar un nuevo paquete).
 
-# Segun el tipo de cambio (semver):
-npm version patch   # 4.1.0 → 4.1.1  (bug fix)
-npm version minor   # 4.1.0 → 4.2.0  (nueva funcionalidad)
-npm version major   # 4.1.0 → 5.0.0  (breaking change)
-```
-
-> `npm version` actualiza el `package.json`, crea un commit y un tag de git automaticamente.
-
-### Build y publicar
+### Paso a paso para publicar una nueva version
 
 ```bash
-# Build (CJS + ESM)
-pnpm --filter @airzone/react-barcode-scanner build
+# 1. Hacer los cambios en el codigo y commitear
+git add .
+git commit -m "feat(scanning): descripcion del cambio"
 
-# Publicar en el registry interno
+# 2. Bump de version (OBLIGATORIO para que CI publique)
 cd packages/react-barcode-scanner
-npm publish
+npm version patch   # bug fix:           4.1.2 → 4.1.3
+npm version minor   # nueva funcion:     4.1.2 → 4.2.0
+npm version major   # breaking change:   4.1.2 → 5.0.0
+
+# 3. Push a ambos remotes (codigo + tag)
+git push origin && git push origin --tags     # GitLab → publica en Verdaccio
+git push github && git push github --tags     # GitHub → publica en GitHub Packages
 ```
+
+A partir de aqui, los pipelines hacen el resto:
+
+**GitLab CI** (`.gitlab-ci.yml`):
+1. **Quality gate**: type-check (`tsc --noEmit`) + lint (`eslint`)
+2. **Publish**: detecta version nueva → build → publica `@airzone/react-barcode-scanner` en Verdaccio
+3. **Release**: crea un release en GitLab asociado al tag
+
+**GitHub Actions** (`.github/workflows/release.yml`):
+1. **Publish**: detecta version nueva → build → publica `@jonsangarx/react-barcode-scanner` en GitHub Packages
+
+### Que hace `npm version`?
+
+El comando `npm version` realiza **3 acciones automaticamente**:
+1. Actualiza el campo `version` en `package.json`
+2. Crea un commit con el mensaje `v4.1.3` (o la version que corresponda)
+3. Crea un tag de git `v4.1.3`
+
+Por eso en el paso 3 solo necesitas hacer `git push && git push --tags`.
 
 ### Verificar la publicacion
 
 ```bash
+# Verdaccio (interno)
 npm info @airzone/react-barcode-scanner --registry http://npmreg.airzonesl.es:4873/
+
+# GitHub Packages
+npm info @jonsangarx/react-barcode-scanner --registry https://npm.pkg.github.com/
 ```
 
-### Flujo completo resumido
+### Publicacion manual (sin CI)
+
+Si necesitas publicar sin pasar por los pipelines (emergencia, CI caido, etc.):
 
 ```bash
-# 1. Hacer cambios en el codigo
-# 2. Commit + push
-git add .
-git commit -m "feat(scanning): descripcion del cambio"
-git push
-
-# 3. Bump de version
 cd packages/react-barcode-scanner
-npm version minor
+npm version patch
+pnpm --filter react-barcode-scanner build
 
-# 4. Push del tag
-git push && git push --tags
-
-# 5. Build + publish
-pnpm --filter @airzone/react-barcode-scanner build
+# Publicar en Verdaccio (como @airzone)
 cd packages/react-barcode-scanner
 npm publish
+
+# Publicar en GitHub Packages (como @jonsangarx)
+npm pkg set name='@jonsangarx/react-barcode-scanner'
+npm pkg set publishConfig.registry='https://npm.pkg.github.com/'
+npm publish --no-git-checks
+git checkout package.json   # restaurar nombre original
+
+# Push
+git push origin && git push origin --tags
+git push github && git push github --tags
+```
+
+### Consumir el paquete desde GitHub Packages (Vercel)
+
+En el proyecto consumidor, instalar como `@jonsangarx/react-barcode-scanner` y configurar el `.npmrc`:
+
+```ini
+@jonsangarx:registry=https://npm.pkg.github.com/
+//npm.pkg.github.com/:_authToken=${NPM_TOKEN}
+```
+
+En Vercel, crear la variable de entorno `NPM_TOKEN` con un GitHub PAT (scope `read:packages`).
+
+### Variables CI/CD necesarias
+
+**GitLab** (Settings > CI/CD > Variables):
+
+| Variable | Valor | Protegida | Enmascarada |
+|----------|-------|-----------|-------------|
+| `NPM_TOKEN` | Token de autenticacion de Verdaccio | Si | Si |
+
+**GitHub Actions**: usa `GITHUB_TOKEN` automaticamente (no requiere configuracion adicional).
+
+Para obtener el token de Verdaccio:
+```bash
+npm login --registry http://npmreg.airzonesl.es:4873/
+# Luego copiar el token de ~/.npmrc
 ```
 
 ## License
