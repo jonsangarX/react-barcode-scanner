@@ -15,9 +15,13 @@
   "bugs": {
     "url": "https://github.com/preflower/react-barcode-scanner/issues"
   },
-  "repository": "https://github.com/preflower/react-barcode-scanner",
+  "repository": "http://gitlab2.airzonesl.es:30080/airzone-front/react-barcode-scanner",
   "author": "Ted Lin <preflower.lin@gmail.com> (https://github.com/preflower)",
+  "contributors": [
+    "Jonathan Sánchez <jon.sanchez.garcia@gmail.com>"
+  ],
   "files": [
+    "README.md",
     "esm/",
     "lib/"
   ],
